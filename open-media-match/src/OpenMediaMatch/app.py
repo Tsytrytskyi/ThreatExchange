@@ -4,6 +4,8 @@ import logging
 import os
 import sys
 import warnings
+from OpenMediaMatch.blueprints.curation import get_all_signal_types
+from OpenMediaMatch.blueprints.curation import get_all_content_types
 
 import flask
 from flask.logging import default_handler
@@ -17,7 +19,7 @@ with warnings.catch_warnings():
 from OpenMediaMatch import database
 from OpenMediaMatch.background_tasks import build_index, fetcher
 from OpenMediaMatch.persistence import get_storage
-from OpenMediaMatch.blueprints import hashing, matching, curation
+from OpenMediaMatch.blueprints import development, hashing, matching, curation
 
 
 def create_app() -> flask.Flask:
@@ -50,8 +52,13 @@ def create_app() -> flask.Flask:
         Sanity check endpoint showing a basic status page
         TODO: in development mode, this could show some useful additional info
         """
+        signaltypes = get_all_signal_types()
+        contenttypes = get_all_content_types()
         return flask.render_template(
-            "index.html.j2", production=app.config.get("PRODUCTION")
+            "index.html.j2",
+            production=app.config.get("PRODUCTION"),
+            signal=signaltypes,
+            content=contenttypes,
         )
 
     @app.route("/status")
@@ -61,10 +68,28 @@ def create_app() -> flask.Flask:
         """
         return "I-AM-ALIVE\n"
 
+    @app.route("/site-map")
+    def site_map():
+        # Use a set to avoid duplicates (e.g. same path, multiple methods)
+        routes = set()
+        for rule in app.url_map.iter_rules():
+            routes.add(rule.rule)
+        # Convert set to a list so we can sort it.
+        routes = list(routes)
+        routes.sort()
+        return routes
+
     # Register Flask blueprints for whichever server roles are enabled...
     # URL prefixing facilitates easy Layer 7 routing :)
     # Linters complain about imports off the top level, but this is needed
     # to prevent circular imports
+
+    if (
+        not os.environ.get("PRODUCTION", False)
+        and app.config.get("ROLE_HASHER", False)
+        and app.config.get("ROLE_MATCHER", False)
+    ):
+        app.register_blueprint(development.bp, url_prefix="/dev")
 
     if app.config.get("ROLE_HASHER", False):
         app.register_blueprint(hashing.bp, url_prefix="/h")
