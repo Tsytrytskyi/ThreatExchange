@@ -4,6 +4,7 @@
 The default store for accessing persistent data on OMM.
 """
 
+import random
 import typing as t
 
 from threatexchange.exchanges.signal_exchange_api import TSignalExchangeAPICls
@@ -17,7 +18,7 @@ from threatexchange.exchanges.fetch_state import (
 from threatexchange.signal_type.pdq.signal import PdqSignal
 from threatexchange.signal_type.md5 import VideoMD5Signal
 
-from sqlalchemy import select, update
+from sqlalchemy import select, delete
 from OpenMediaMatch import database
 
 from OpenMediaMatch.storage import interface
@@ -69,9 +70,49 @@ class DefaultOMMStore(interface.IUnifiedStore):
         return MockedUnifiedStore().get_exchange_type_configs()
 
     def get_signal_type_configs(self) -> t.Mapping[str, SignalTypeConfig]:
+        # If a signal is installed, then it is enabled by default. But it may be disabled by an
+        # override in the database.
+        signal_type_overrides = self._query_signal_type_overrides()
+        get_enabled_ratio = (
+            lambda s: signal_type_overrides[s.get_name()]
+            if s.get_name() in signal_type_overrides
+            else 1.0
+        )
         return {
-            s.get_name(): interface.SignalTypeConfig(True, s) for s in self.signal_types
+            s.get_name(): interface.SignalTypeConfig(
+                # Note - we do this logic here because this function is re-executed each request
+                get_enabled_ratio(s),
+                s,
+            )
+            for s in self.signal_types
         }
+
+    def _create_or_update_signal_type_override(
+        self, signal_type: str, enabled_ratio: float
+    ) -> None:
+        """Create or update database entry for a signal type, setting a new value."""
+        db_record = database.db.session.execute(
+            select(database.SignalTypeOverride).where(
+                database.SignalTypeOverride.name == signal_type
+            )
+        ).scalar_one_or_none()
+        if db_record is not None:
+            db_record.enabled_ratio = enabled_ratio
+        else:
+            database.db.session.add(
+                database.SignalTypeOverride(
+                    name=signal_type, enabled_ratio=enabled_ratio
+                )
+            )
+
+        database.db.session.commit()
+
+    @staticmethod
+    def _query_signal_type_overrides() -> dict[str, float]:
+        db_records = database.db.session.execute(
+            select(database.SignalTypeOverride)
+        ).all()
+        return {record.name: record.enabled_ratio for record, in db_records}
 
     # Index
     def get_signal_type_index(
@@ -149,21 +190,29 @@ class DefaultOMMStore(interface.IUnifiedStore):
             select(database.Bank).where(database.Bank.name == name)
         ).scalar_one_or_none()
 
-    def bank_update(self, bank: BankConfig, *, create: bool = False) -> None:
+    def bank_update(
+        self,
+        bank: BankConfig,
+        *,
+        create: bool = False,
+        rename_from: t.Optional[str] = None,
+    ) -> None:
         if create:
             database.db.session.add(database.Bank.from_storage_iface_cls(bank))
         else:
-            database.db.session.execute(
-                update(database.Bank)
-                .where(database.Bank.name == bank.name)
-                .values(enabled_ratio=bank.matching_enabled_ratio)
-            )
+            previous = database.Bank.query.filter_by(
+                name=rename_from if rename_from is not None else bank.name
+            ).one_or_404()
+            previous.name = bank.name
+            previous.enabled_ratio = bank.matching_enabled_ratio
 
         database.db.session.commit()
 
     def bank_delete(self, name: str) -> None:
-        # TODO
-        raise Exception("Not implemented")
+        database.db.session.execute(
+            delete(database.Bank).where(database.Bank.name == name)
+        )
+        database.db.session.commit()
 
     def bank_content_get(self, ids: t.Iterable[int]) -> t.Sequence[BankContentConfig]:
         return [
